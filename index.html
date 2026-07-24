@@ -1725,8 +1725,89 @@ async function ghPutJSON(path, obj, message){
   if(!res.ok) throw new Error('write failed ('+res.status+')');
   return res.json();
 }
+
+/* ============================================================
+   GITHUB LARGE-FILE UPLOAD — Git Data API (blob/tree/commit/ref)
+   The Contents API (PUT /contents/{path}) only reliably accepts
+   files up to ~1MB. Anything bigger (PDF reports, phone photos,
+   any video) must go through the Git Data API instead, which
+   supports files up to 100MB. ghPutFile() below picks the right
+   path automatically based on file size.
+   ============================================================ */
+const GH_CONTENTS_API_SAFE_LIMIT = 1000000; // ~1MB — GitHub Contents API ceiling
+
+async function ghGetRefSha(c){
+  const res = await fetch(`${GH_API}/repos/${c.owner}/${c.repo}/git/ref/heads/${c.branch}`, {
+    headers:{ Authorization:`token ${c.token}` }
+  });
+  if(!res.ok) throw new Error('could not read branch ref ('+res.status+')');
+  const data = await res.json();
+  return data.object.sha;
+}
+async function ghGetCommitTreeSha(c, commitSha){
+  const res = await fetch(`${GH_API}/repos/${c.owner}/${c.repo}/git/commits/${commitSha}`, {
+    headers:{ Authorization:`token ${c.token}` }
+  });
+  if(!res.ok) throw new Error('could not read commit ('+res.status+')');
+  const data = await res.json();
+  return data.tree.sha;
+}
+async function ghCreateBlob(c, base64Content){
+  const res = await fetch(`${GH_API}/repos/${c.owner}/${c.repo}/git/blobs`, {
+    method:'POST',
+    headers:{ Authorization:`token ${c.token}`, 'Content-Type':'application/json' },
+    body: JSON.stringify({ content: base64Content, encoding:'base64' })
+  });
+  if(!res.ok) throw new Error('blob creation failed ('+res.status+') — file may be too large or connection dropped mid-upload');
+  const data = await res.json();
+  return data.sha;
+}
+async function ghCreateTree(c, baseTreeSha, path, blobSha){
+  const res = await fetch(`${GH_API}/repos/${c.owner}/${c.repo}/git/trees`, {
+    method:'POST',
+    headers:{ Authorization:`token ${c.token}`, 'Content-Type':'application/json' },
+    body: JSON.stringify({ base_tree: baseTreeSha, tree:[{ path, mode:'100644', type:'blob', sha: blobSha }] })
+  });
+  if(!res.ok) throw new Error('tree creation failed ('+res.status+')');
+  const data = await res.json();
+  return data.sha;
+}
+async function ghCreateCommit(c, treeSha, parentSha, message){
+  const res = await fetch(`${GH_API}/repos/${c.owner}/${c.repo}/git/commits`, {
+    method:'POST',
+    headers:{ Authorization:`token ${c.token}`, 'Content-Type':'application/json' },
+    body: JSON.stringify({ message, tree: treeSha, parents:[parentSha] })
+  });
+  if(!res.ok) throw new Error('commit creation failed ('+res.status+')');
+  const data = await res.json();
+  return data.sha;
+}
+async function ghUpdateRef(c, commitSha){
+  const res = await fetch(`${GH_API}/repos/${c.owner}/${c.repo}/git/refs/heads/${c.branch}`, {
+    method:'PATCH',
+    headers:{ Authorization:`token ${c.token}`, 'Content-Type':'application/json' },
+    body: JSON.stringify({ sha: commitSha })
+  });
+  if(!res.ok) throw new Error('branch update failed ('+res.status+') — someone else may have pushed at the same time, try again');
+  return res.json();
+}
+async function ghPutFileLarge(path, file, message){
+  const c = requireAdmin(); if(!c) throw new Error('not signed in');
+  const base64 = await fileToBase64(file);
+  const headSha = await ghGetRefSha(c);
+  const baseTreeSha = await ghGetCommitTreeSha(c, headSha);
+  const blobSha = await ghCreateBlob(c, base64);
+  const newTreeSha = await ghCreateTree(c, baseTreeSha, path, blobSha);
+  const newCommitSha = await ghCreateCommit(c, newTreeSha, headSha, message);
+  await ghUpdateRef(c, newCommitSha);
+  return { path, commit: newCommitSha };
+}
 async function ghPutFile(path, file, message){
   const c = requireAdmin(); if(!c) throw new Error('not signed in');
+  if(file.size > GH_CONTENTS_API_SAFE_LIMIT){
+    // Large file — Contents API would reject this, use Git Data API instead.
+    return ghPutFileLarge(path, file, message);
+  }
   const b64 = await fileToBase64(file);
   const body = { message, content: b64, branch: c.branch };
   const res = await fetch(`${GH_API}/repos/${c.owner}/${c.repo}/contents/${path}`, {
@@ -1734,7 +1815,13 @@ async function ghPutFile(path, file, message){
     headers:{ Authorization:`token ${c.token}`, 'Content-Type':'application/json' },
     body: JSON.stringify(body)
   });
-  if(!res.ok) throw new Error('upload failed ('+res.status+')');
+  if(!res.ok){
+    // Fallback: if the Contents API rejects it for any size-related reason, retry via Git Data API.
+    if(res.status === 413 || res.status === 422 || res.status === 400){
+      return ghPutFileLarge(path, file, message);
+    }
+    throw new Error('upload failed ('+res.status+')');
+  }
   return res.json();
 }
 async function ghDeleteFromManifest(manifestPath, itemToRemove, message){
@@ -1867,6 +1954,7 @@ document.getElementById('addProjectForm').addEventListener('submit', async funct
     let pdfPath = null;
     if(pdfFile){
       pdfPath = 'assets/documents/' + slugFile(pdfFile.name);
+      status.textContent = pdfFile.size > GH_CONTENTS_API_SAFE_LIMIT ? 'Uploading large PDF via Git Data API…' : 'Uploading PDF…';
       await ghPutFile(pdfPath, pdfFile, 'Add project report PDF: '+pdfFile.name);
     }
     const entry = { title, desc, category:cat, tags, pdf: pdfPath, gallery:null, video:null };
@@ -1928,6 +2016,7 @@ document.getElementById('addPubForm').addEventListener('submit', async function(
     let pdfPath = null;
     if(pdfFile){
       pdfPath = 'assets/documents/' + slugFile(pdfFile.name);
+      status.textContent = pdfFile.size > GH_CONTENTS_API_SAFE_LIMIT ? 'Uploading large PDF via Git Data API…' : 'Uploading PDF…';
       await ghPutFile(pdfPath, pdfFile, 'Add publication PDF: '+pdfFile.name);
     }
     const entry = { title, meta, link: link || null, pdf: pdfPath };
@@ -1992,6 +2081,7 @@ document.getElementById('addCertForm').addEventListener('submit', async function
     const pdfFile = document.getElementById('certPdf').files[0];
     if(!pdfFile) throw new Error('Choose a PDF file.');
     const pdfPath = 'assets/documents/' + slugFile(pdfFile.name);
+    status.textContent = pdfFile.size > GH_CONTENTS_API_SAFE_LIMIT ? 'Uploading large PDF via Git Data API…' : 'Uploading…';
     await ghPutFile(pdfPath, pdfFile, 'Add certificate PDF: '+pdfFile.name);
     const entry = { title, pdf: pdfPath, icon:'fa-award' };
     const existing = await ghGetFile('assets/data/certificates.json');
@@ -2044,6 +2134,7 @@ document.getElementById('addDocForm').addEventListener('submit', async function(
     const pdfFile = document.getElementById('docPdf').files[0];
     if(!pdfFile) throw new Error('Choose a PDF file.');
     const pdfPath = 'assets/documents/' + slugFile(pdfFile.name);
+    status.textContent = pdfFile.size > GH_CONTENTS_API_SAFE_LIMIT ? 'Uploading large PDF via Git Data API…' : 'Uploading…';
     await ghPutFile(pdfPath, pdfFile, 'Add document PDF: '+pdfFile.name);
     const entry = { title, pdf: pdfPath };
     const existing = await ghGetFile('assets/data/documents.json');
@@ -2082,7 +2173,7 @@ document.getElementById('addImgForm').addEventListener('submit', async function(
     const list = existing.json || [];
     for(let i=0;i<files.length;i++){
       const f = files[i];
-      status.textContent = `Uploading ${i+1} of ${files.length}: ${f.name}…`;
+      status.textContent = `Uploading ${i+1} of ${files.length}: ${f.name}${f.size > GH_CONTENTS_API_SAFE_LIMIT ? ' (large file, via Git Data API)' : ''}…`;
       const path = `assets/gallery/images/${cat}/${slugFile(f.name)}`;
       await ghPutFile(path, f, 'Add gallery image: '+f.name);
       list.unshift({ file: path, category:cat, caption: caption || f.name });
@@ -2120,7 +2211,7 @@ document.getElementById('addVidForm').addEventListener('submit', async function(
     const list = existing.json || [];
     for(let i=0;i<files.length;i++){
       const f = files[i];
-      status.textContent = `Uploading ${i+1} of ${files.length}: ${f.name}…`;
+      status.textContent = `Uploading ${i+1} of ${files.length}: ${f.name}${f.size > GH_CONTENTS_API_SAFE_LIMIT ? ' (large file, via Git Data API — this can take a while)' : ''}…`;
       const path = `assets/gallery/videos/${cat}/${slugFile(f.name)}`;
       await ghPutFile(path, f, 'Add gallery video: '+f.name);
       list.unshift({ file: path, category:cat, title: title || f.name, desc:'', poster:'' });
